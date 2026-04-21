@@ -1,0 +1,2 @@
+Hello from the RUDP-HTTP server.
+This file was served over a stop-and-wait reliable transport that runs on top of UDP datagrams.

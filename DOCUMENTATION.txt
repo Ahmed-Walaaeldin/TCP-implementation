@@ -1,0 +1,520 @@
+================================================================================
+CC451 - Computer Networks Lab 4
+Reliable UDP Transport + HTTP/1.0 Layer
+Alexandria University, Faculty of Engineering
+Computer and Communications Engineering Program, Spring 2026
+================================================================================
+
+Author:   Cortex
+Language: Python 3 (standard library only - no third-party dependencies)
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+  1.  Project overview & requirement mapping
+  2.  File & module structure
+  3.  RUDP protocol specification
+        3.1  Packet header format
+        3.2  Flag semantics
+        3.3  Internet checksum (RFC 1071)
+        3.4  Sequence / acknowledgement number semantics
+        3.5  Three-way handshake (SYN / SYN-ACK / ACK)
+        3.6  Reliable data transfer (stop-and-wait ARQ)
+        3.7  Connection teardown (FIN / ACK)
+  4.  Reliability mechanisms
+  5.  Loss, corruption & false-checksum simulation
+  6.  HTTP/1.0 layer
+        6.1  Message parsing
+        6.2  Server architecture
+        6.3  Client architecture
+        6.4  Supported status codes
+  7.  How to run
+  8.  Test suite (25 tests) - description and mapping
+  9.  Assumptions & limitations
+  10. Browser-compatibility bonus - honest assessment
+
+================================================================================
+1.  PROJECT OVERVIEW & REQUIREMENT MAPPING
+================================================================================
+
+The lab specifies a system that simulates TCP-style reliable transport on top
+of UDP, with an HTTP/1.0 server and client layered above it. Every explicit
+requirement from the lab document is addressed below:
+
+    REQUIREMENT                                          WHERE IT LIVES
+    ----------------------------------------------       ------------------------
+    UDP sockets only (python socket module)              rudp.py  (socket.SOCK_DGRAM)
+    New class encapsulating reliable transport           rudp.py  (RUDPSocket)
+    Stop-and-wait ARQ                                    rudp.py  (_send_one_data_segment)
+    Checksum on every packet; drop on mismatch           rudp.py  (_verify_checksum,
+                                                                    _deserialize_packet)
+    Method to simulate false checksum                    rudp.py  (force_bad_checksum_next_send)
+    Retransmission on timeout                            rudp.py  (_send_one_data_segment)
+    Simulate packet loss (dedicated method)              rudp.py  (_simulate_loss)
+    Simulate packet corruption (dedicated method)        rudp.py  (_simulate_corruption)
+    SYN / SYN-ACK / ACK handshake                        rudp.py  (connect, accept,
+                                                                    _complete_server_handshake)
+    FIN teardown + duplicate / reorder handling          rudp.py  (close, _process_incoming)
+    Sequence numbers                                     rudp.py  (random ISN, per-segment inc.)
+    Duplicate-packet detection                           rudp.py  (expected_recv_seq logic)
+    HTTP/1.0 parsing (requests & responses)              http_message.py
+    HTTP GET                                             http_server.py (_handle_get)
+    HTTP POST                                            http_server.py (_handle_post)
+    Status codes (200 OK, 404 Not Found, and more)       http_message.py (STATUS_MESSAGES)
+    HTTP headers (several implemented)                   http_message.py (Headers class)
+    Bonus: test cases                                    tests.py (25 unit + integration tests)
+
+================================================================================
+2.  FILE & MODULE STRUCTURE
+================================================================================
+
+    rudp_http_project/
+        DOCUMENTATION.txt     -- this file
+        rudp.py               -- RUDPSocket class + packet (de)serialisation
+        http_message.py       -- HTTPRequest, HTTPResponse, Headers, parsing
+        http_server.py        -- HTTP/1.0 server (uses RUDPSocket)
+        http_client.py        -- HTTP/1.0 client library + CLI
+        demo.py               -- end-to-end demonstration with --debug trace
+        tests.py              -- 25 automated tests (unit + integration)
+        webroot/
+            index.html        -- styled sample landing page
+            hello.txt         -- sample plain-text resource
+
+Module layering:
+
+    +-----------------------------+
+    |  http_server.py / client.py |   <-- application layer
+    +-----------------------------+
+    |       http_message.py       |   <-- HTTP parsing & serialisation
+    +-----------------------------+
+    |          rudp.py            |   <-- reliable stream on top of UDP
+    +-----------------------------+
+    |    socket.SOCK_DGRAM (UDP)  |   <-- operating-system layer
+    +-----------------------------+
+
+Only the RUDPSocket class crosses the UDP boundary; the HTTP modules are
+transport-agnostic and could, in principle, run over a different reliable
+byte-stream without changes.
+
+================================================================================
+3.  RUDP PROTOCOL SPECIFICATION
+================================================================================
+
+3.1  Packet header format
+-------------------------
+Every packet (regardless of flags) carries a fixed 13-byte header followed by
+an optional payload:
+
+        0                   1                   2                   3
+        0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+       |                    Sequence Number (32)                       |
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+       |                 Acknowledgement Number (32)                   |
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+       |     Flags (8)   |       Checksum (16)       | Payload-Len(16) |
+       +-----------------+---------------------------+-----------------+
+       |                  Payload (0 .. 1024 bytes)  ...               |
+
+Encoded with Python's struct format "!IIBHH" (network byte order = big endian).
+
+3.2  Flag semantics
+-------------------
+Only three flag bits are used; they may be combined:
+
+        FLAG_SYN = 0x01   -- connection-establishment request
+        FLAG_ACK = 0x02   -- cumulative acknowledgement is valid
+        FLAG_FIN = 0x04   -- sender has no more data
+
+Typical flag combinations seen on the wire:
+
+    SYN               -- client -> server, first handshake packet
+    SYN | ACK         -- server -> client, second handshake packet
+    ACK               -- pure acknowledgement (no payload)
+    ACK (with data)   -- piggybacked acknowledgement carrying payload
+    FIN               -- teardown; may or may not carry ACK
+    FIN | ACK         -- FIN that also acknowledges the peer's FIN
+
+3.3  Internet checksum (RFC 1071)
+---------------------------------
+The checksum covers BOTH the header (with the checksum field zeroed) AND the
+payload. This is what the lab document hints at when it says "think of what
+you should include from the packet while calculating the checksum".
+
+Algorithm (exactly RFC 1071):
+
+    1.  If the buffer has odd length, pad with a single zero byte.
+    2.  Sum all consecutive 16-bit big-endian words into a 32-bit accumulator.
+    3.  Fold the high 16 bits into the low 16 bits - repeat until zero.
+    4.  One's-complement the result (bitwise NOT, masked to 16 bits).
+
+Code lives in rudp.py :: internet_checksum(). The RFC 1071 sample input
+(45 00 00 30 44 22 40 00 80 06 00 00 8c 7c 19 ac ae 24 1e 2b) is verified
+by the unit test test_rfc1071_vector, which expects 0x220D.
+
+When a packet arrives, RUDPSocket zeroes bytes 9..11 of the header (the
+checksum field), recomputes, and compares. A mismatch -> the packet is
+dropped silently; the sender's timer will eventually fire and retransmit.
+
+3.4  Sequence / acknowledgement number semantics
+------------------------------------------------
+Sequence numbers in this implementation are PER-SEGMENT, not per-byte. This is
+a deliberate simplification that is explicitly allowed by the lab (stop-and-
+wait, no windows, no congestion control). It keeps the protocol easy to reason
+about while preserving the essential correctness argument.
+
+Rules:
+
+    * Initial Sequence Number (ISN) is chosen randomly by each side
+      (see random.randint in __init__). Real TCP does this to defend
+      against stale-segment spoofing; here it is mostly pedagogical and
+      produces much more realistic debug traces than "always 0".
+    * SYN, DATA, and FIN each consume exactly one sequence number.
+    * A pure ACK packet does NOT consume a sequence number.
+    * The ack field is cumulative: it names the NEXT sequence number the
+      receiver expects, i.e. it acknowledges everything strictly below it.
+
+3.5  Three-way handshake
+------------------------
+Client (connect)                        Server (accept)
+
+    seq = ISN_c                             (listening)
+    SYN(seq=ISN_c)        ------>
+                                            seq = ISN_s
+                          <------  SYN+ACK(seq=ISN_s, ack=ISN_c+1)
+    ACK(seq=ISN_c+1, ack=ISN_s+1) ->
+                                            handshake complete
+    (connected)                             (connected)
+
+Implementation details:
+
+    * connect() sends SYN up to MAX_RETRIES times, 1 s timeout each.
+    * accept() is blocking: it loops on recvfrom() until a SYN arrives,
+      then replies with SYN-ACK and waits for the matching ACK.
+    * If the final ACK is lost, the server's retransmission of SYN-ACK
+      (triggered by its own timeout, handled inside
+      _complete_server_handshake) recovers the situation.
+
+3.6  Reliable data transfer (stop-and-wait ARQ)
+-----------------------------------------------
+send() fragments the caller's bytes into MAX_PAYLOAD (= 1024)-byte chunks and
+calls _send_one_data_segment for each:
+
+    loop up to MAX_RETRIES times:
+        apply force_bad_checksum if armed (XOR 0xFF into checksum byte)
+        apply _simulate_loss      -- may drop the segment entirely
+        apply _simulate_corruption -- may flip one random bit
+        sendto(segment)
+        wait up to TIMEOUT (default 1 s) for an ACK with ack == seq+1
+            -> receive and check checksum; drop silently on mismatch
+            -> if wrong ack number, treat as duplicate and keep waiting
+        if valid ACK: break, advance seq
+    if loop exhausts: raise RUDPError("max retries")
+
+recv() runs a single-segment receive loop: it accepts only the segment whose
+sequence number equals expected_recv_seq; any duplicate (seq < expected) is
+silently acknowledged again (so the peer can make progress) and otherwise
+ignored.
+
+Correctness argument (informal, classical):
+    With alternating-bit / stop-and-wait, the sender transmits segment N and
+    refuses to move on until it sees ACK(N+1). Duplicates are detected because
+    expected_recv_seq advances monotonically. Reordering is impossible in
+    stop-and-wait because only one segment is ever in flight. Therefore the
+    only remaining failure mode is permanent channel failure, which manifests
+    as MAX_RETRIES exhaustion and a clean user-visible error.
+
+3.7  Connection teardown
+------------------------
+close() sends a FIN, waits for an ACK, and then drains any pending packets:
+
+    Side A                            Side B
+    FIN(seq=X)           ----->
+                         <-----     ACK(ack=X+1)
+                         <-----     FIN(seq=Y)
+    ACK(ack=Y+1)         ----->
+
+Simultaneous close (both sides FIN at once) is handled: if an incoming FIN
+arrives while we are waiting for the ACK of our own FIN, we reply with an ACK
+to the peer's FIN and continue waiting for our own ACK.
+
+================================================================================
+4.  RELIABILITY MECHANISMS
+================================================================================
+
+Summary of which category each mechanism handles:
+
+    Failure mode          Detection                  Recovery
+    -----------------     -----------------------    --------------------------
+    Packet loss           No ACK within TIMEOUT      Retransmit same segment
+    Packet corruption     Checksum mismatch on       Drop at receiver
+                           receive                     -> sender timeout
+                                                       -> retransmit
+    Duplicate packet      seq != expected_recv_seq   Drop at receiver but
+                                                     re-ACK the lower seq so
+                                                     the sender can advance
+    Reordering            Impossible under S&W       N/A (window size = 1)
+
+Statistics tracked (per RUDPSocket):
+    pkts_sent, pkts_recv, retransmissions, corrupt_drops,
+    duplicates, simulated_losses, simulated_corruptions
+
+These are printed at the end of every run in demo.py and exposed as
+sock.stats for programmatic inspection.
+
+================================================================================
+5.  LOSS, CORRUPTION, AND FALSE-CHECKSUM SIMULATION
+================================================================================
+
+Three independent mechanisms, configurable per-socket:
+
+    set_loss_rate(p)         0 <= p <= 1, Bernoulli-drop every outgoing packet
+    set_corruption_rate(p)   0 <= p <= 1, Bernoulli-flip one random bit
+                             in the serialised bytes before sendto
+    force_bad_checksum_next_send()
+                             one-shot tamper: the next sendto will have its
+                             checksum byte XOR'd with 0xFF, so the receiver
+                             will see a mismatched checksum and drop it
+
+The last mechanism is the one explicitly requested by the lab:
+
+    "You will need a method to simulate a false checksum to see what happens.
+     The sender then realizes that there is no ack received from the receiver
+     and timeout and resends it again."
+
+Test ForcedBadChecksumTests.test_one_shot_bad_checksum_triggers_retransmit
+verifies exactly that behaviour: after forcing one bad checksum, the payload
+still arrives (because of retransmission) and the retransmissions counter
+has increased by at least one.
+
+Loss and corruption are implemented as dedicated methods rather than inline
+probability checks, again because the lab specifically says:
+
+    "Implement packet loss and packet corruption and implement methods
+     that are specially created for this purpose."
+
+The relevant methods are _simulate_loss() and _simulate_corruption().
+
+================================================================================
+6.  HTTP/1.0 LAYER
+================================================================================
+
+6.1  Message parsing
+--------------------
+http_message.py defines:
+
+    Headers         -- case-insensitive dict that preserves first-seen casing
+    HTTPRequest     -- method / path / version / headers / body
+    HTTPResponse    -- status / reason / version / headers / body
+
+Each class has to_bytes() (serialise) and from_bytes() (parse). Because HTTP
+messages arrive in chunks over the byte stream provided by RUDPSocket, two
+helper functions exist to read one complete message:
+
+    read_full_request(sock)   -- reads headers, then uses Content-Length to
+                                  read the POST body if any
+    read_full_response(sock)  -- reads headers, then honours Content-Length
+                                  if present, otherwise reads until EOF
+                                  (which is the HTTP/1.0 rule)
+
+6.2  Server architecture
+------------------------
+http_server.py accepts one connection at a time (consistent with stop-and-wait
+single-in-flight design). For each connection:
+
+    1.  read full request
+    2.  dispatch on method
+            GET   -> _handle_get  -- maps URL to webroot, auto-detects MIME,
+                                     200 OK + file bytes, or 404 Not Found
+            POST  -> _handle_post -- saves body to webroot/<safe-path>,
+                                     returns 201 Created with Location header
+            other -> 405 Method Not Allowed
+    3.  send response, close RUDP connection
+    4.  rebind UDP port to be ready for the next client
+
+Security: URLs are normalised with os.path.normpath and rejected with 403
+Forbidden if they try to escape the webroot (../ traversal).
+
+Supported MIME types: html, htm, txt, css, js, json, png, jpg, jpeg, gif, pdf.
+
+6.3  Client architecture
+------------------------
+http_client.py provides library functions http_get(url) and http_post(url, body)
+plus a command-line wrapper. URL parsing uses urllib.parse.urlparse, so forms
+like http://127.0.0.1:9000/index.html?x=1 work.
+
+6.4  Supported status codes
+---------------------------
+    200 OK                                   (file found, GET)
+    201 Created                              (POST success)
+    204 No Content                           (empty POST)
+    400 Bad Request                          (malformed message)
+    403 Forbidden                            (path traversal)
+    404 Not Found                            (missing file)
+    405 Method Not Allowed                   (anything other than GET/POST)
+    500 Internal Server Error                (unhandled exception)
+
+The lab requires only 200 and 404; the rest are free since Headers/HTTPResponse
+are generic.
+
+================================================================================
+7.  HOW TO RUN
+================================================================================
+
+All commands assume cwd = rudp_http_project/.
+
+A.  Run the full test suite (25 tests, ~10 s on a laptop):
+
+        python tests.py
+
+    Expected tail:  Ran 25 tests in ~10s   OK
+
+B.  Run the demo (starts server, issues 5 requests, prints stats):
+
+        python demo.py                       # quiet
+        python demo.py --debug               # print every packet on the wire
+        python demo.py --debug --loss 0.1    # inject 10% packet loss
+        python demo.py --debug --corrupt 0.1 # inject 10% bit-flip corruption
+
+    With --debug you will see the full handshake, data transfer, and FIN
+    teardown exchanges, with real randomly-chosen ISNs.
+
+C.  Stand-alone server:
+
+        python http_server.py --host 127.0.0.1 --port 9000 --webroot ./webroot --debug
+
+D.  Stand-alone client:
+
+        python http_client.py GET  http://127.0.0.1:9000/index.html
+        python http_client.py POST http://127.0.0.1:9000/note.txt --data "hello"
+        python http_client.py GET  http://127.0.0.1:9000/note.txt
+
+================================================================================
+8.  TEST SUITE (25 TESTS)
+================================================================================
+
+tests.py groups the tests into six TestCase classes. All 25 pass in ~10 s.
+
+    ChecksumTests                                                    (6)
+    ---------------------------------------------------------------------
+    test_empty_buffer_checksum              empty -> 0xFFFF
+    test_rfc1071_vector                     RFC 1071 example -> 0x220D
+    test_odd_length_padding                 odd-length buffer padded correctly
+    test_range_16_bit                       200 random inputs, all in 0..0xFFFF
+    test_bit_sensitivity                    single-bit flip changes checksum
+    test_self_verifying_when_aligned        classical self-check property
+
+    PacketTests                                                      (6)
+    ---------------------------------------------------------------------
+    test_serialize_deserialize_syn          SYN round-trip
+    test_serialize_deserialize_data         DATA round-trip with payload
+    test_too_short_returns_none             truncated header -> None
+    test_corrupted_header_detected          any header bit-flip -> None
+    test_corrupted_payload_detected         payload bit-flip -> None
+    test_truncated_payload_detected         short payload field -> None
+
+    HTTPMessageTests                                                 (5)
+    ---------------------------------------------------------------------
+    test_request_get_round_trip             GET serialise/parse
+    test_request_post_round_trip            POST with body
+    test_response_round_trip                generic response
+    test_404_response_encoding              404 status string
+    test_headers_case_insensitive           case-insensitive Headers
+
+    HTTPEndToEndTests                                                (4)
+    ---------------------------------------------------------------------
+    test_get_200                            GET existing file over RUDP
+    test_get_404                            GET missing file -> 404
+    test_get_large_file                     5 KB file -> multi-segment transfer
+    test_post_then_get                      POST body, GET it back (2.4 KB)
+
+    ReliabilityTests                                                 (3)
+    ---------------------------------------------------------------------
+    test_delivery_under_loss                20% loss -> still correct
+    test_delivery_under_corruption          20% corruption -> still correct
+    test_delivery_under_mixed               10% loss + 10% corruption -> ok
+
+    ForcedBadChecksumTests                                           (1)
+    ---------------------------------------------------------------------
+    test_one_shot_bad_checksum_triggers_retransmit
+                                            deliberately tamper checksum once;
+                                            verify payload still arrives AND
+                                            retransmissions counter > 0
+
+================================================================================
+9.  ASSUMPTIONS & LIMITATIONS
+================================================================================
+
+a)  Sequence numbers are per-segment (not per-byte as in real TCP). This is
+    consistent with a stop-and-wait protocol where there is at most one
+    segment outstanding at any time.
+
+b)  Window size is 1 (strict stop-and-wait) because the lab explicitly
+    says window size and congestion control are not required.
+
+c)  One server accepts one client at a time. Concurrent clients are out of
+    scope. Implementing it would require demultiplexing by (peer-ip, peer-
+    port) inside RUDPSocket or using a fresh ephemeral port per connection
+    (what real TCP does) - both possible but not requested.
+
+d)  HTTP is strictly 1.0: each request uses a fresh connection, Connection:
+    close is always sent, there are no persistent connections or pipelining.
+
+e)  Maximum payload per segment = 1024 bytes. A typical Ethernet MTU is
+    1500, so this leaves room for the 13-byte RUDP header, the 8-byte UDP
+    header and the 20-byte IPv4 header without IP fragmentation.
+
+f)  Default socket timeout is 1 s, retry budget is 10. With these defaults
+    a completely silent peer will be detected within 10 s.
+
+g)  Checksum is 16-bit Internet checksum. It is not cryptographically strong,
+    but it is exactly what the lab refers to when it says "checksum (see
+    3.3.2)" - RFC 1071 is the canonical reference.
+
+h)  This implementation does NOT interoperate with real TCP or real HTTP
+    browsers directly; see section 10 for an honest discussion.
+
+================================================================================
+10. BROWSER-COMPATIBILITY BONUS - HONEST ASSESSMENT
+================================================================================
+
+The lab's bonus reads:
+
+    "Bonus: make a valid communication from any web browser to your newly
+     implemented HTTP server and show the traffic using Wireshark."
+
+This cannot be achieved directly, because web browsers speak HTTP-over-TCP,
+not HTTP-over-RUDP-over-UDP. A browser will refuse to open a UDP socket for
+an http:// URL; it will always do an active-open TCP SYN to port 80 (or
+whatever the URL specifies).
+
+Two possible workarounds - neither strictly required by the lab - would be:
+
+    (i)   Add a TCP<->RUDP bridge process. A small proxy listens on TCP port
+          80, accepts the browser's connection, and tunnels every byte
+          through RUDPSocket to the actual HTTP server. The proxy itself is
+          straightforward (socat-style), but it does mean the actual traffic
+          on the wire would be a mix of TCP (browser<->proxy) and UDP
+          (proxy<->server), which Wireshark can still display nicely with
+          two separate filters.
+
+    (ii)  Use a browser that supports QUIC (HTTP/3). That moves HTTP onto
+          UDP at the protocol-stack level, but the details of QUIC differ
+          significantly from this toy RUDP, so it would require re-
+          implementing the server against the QUIC wire format. This is
+          well beyond the scope of the lab.
+
+For the purpose of demonstrating the protocol with Wireshark, the demo
+script with --debug provides a perfectly readable trace, and running
+
+    python demo.py --debug
+
+while capturing on the loopback interface with filter
+
+    udp port 9000
+
+shows every RUDP packet - handshake, data, retransmission, FIN.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
