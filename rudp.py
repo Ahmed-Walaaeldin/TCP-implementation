@@ -1,18 +1,3 @@
-"""
-Implements a TCP-like reliable stream abstraction on top of UDP:
-    * 3-way handshake            (SYN / SYN-ACK / ACK)
-    * Stop-and-Wait ARQ          (one outstanding packet at a time)
-    * Internet checksum          (16-bit one's complement)
-    * Timeout-based retransmission
-    * Duplicate detection        (seq# based, receiver re-ACKs)
-    * Connection teardown        (FIN / ACK)
-    * Simulated packet loss and packet corruption for testing
-
-The RUDPSocket class exposes a Berkeley-socket-like API:
-    bind() / connect() / accept() / send() / recv() / close()
-
-"""
-
 from __future__ import annotations
 
 import os
@@ -21,27 +6,6 @@ import socket
 import struct
 import time
 from typing import Optional, Tuple
-
-# ---------------------------------------------------------------------------
-# Packet format
-# ---------------------------------------------------------------------------
-#
-# Our packet carries a fixed 13-byte header followed by up to MAX_PAYLOAD
-# payload bytes. All multi-byte fields are network byte order (big-endian).
-#
-#     0                   1                   2                   3
-#     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-#    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#    |                      Sequence Number (32)                     |
-#    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#    |                   Acknowledgment Number (32)                  |
-#    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#    |  Flags (8)  |        Checksum (16)        |  Payload Len (16) |
-#    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#    |                     Payload (variable)                        |
-#    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#
-# Flags bits: SYN=0x01, ACK=0x02, FIN=0x04
 
 FLAG_SYN = 0x01
 FLAG_ACK = 0x02
@@ -56,10 +20,8 @@ MAX_PACKET = HEADER_LEN + MAX_PAYLOAD
 DEFAULT_TIMEOUT = 1.0                       # seconds per retransmission timer
 DEFAULT_MAX_RETRIES = 10                    # how many times we retransmit
 
-
-# ---------------------------------------------------------------------------
 # Checksum (Internet checksum, RFC 1071)
-# ---------------------------------------------------------------------------
+
 
 def internet_checksum(data: bytes) -> int:
     """
@@ -72,13 +34,6 @@ def internet_checksum(data: bytes) -> int:
            of the 16-bit sum is wrapped back in).
         3. The checksum is the one's complement of the final sum.
 
-    Properties we rely on:
-        * If the sender places 0 in the checksum field, computes the sum
-          over the whole packet, and writes the complement there, then
-          the receiver who sums the entire packet (including the stored
-          checksum) will get all-ones. Equivalently, we verify by
-          recomputing with the field zeroed and comparing to the stored
-          checksum.
     """
     if len(data) % 2 == 1:
         data = data + b"\x00"
@@ -104,15 +59,7 @@ def make_packet(seq, ack, flags, payload=b"", window=65535):
 
 
 def parse_packet(raw: bytes) -> Optional[dict]:
-    """
-    Parse a wire-format packet. Returns a dict with keys
-        seq, ack, flags, checksum, payload, valid
-    or None if the bytes are too short to even contain a header.
 
-    `valid` is False if the checksum fails. The caller should drop
-    invalid packets (simulating a real receiver that cannot trust
-    corrupted bytes).
-    """
     if len(raw) < HEADER_LEN:
         return None
     seq, ack, flags, chk, plen, window = struct.unpack(HEADER_FMT, raw[:HEADER_LEN])
@@ -144,42 +91,12 @@ def flags_to_str(flags: int) -> str:
         names.append("DATA")
     return "|".join(names)
 
-
-# ---------------------------------------------------------------------------
+               
 # RUDPSocket — the reliable transport class
-# ---------------------------------------------------------------------------
 
 class RUDPSocket:
-    """
-    A connection-oriented reliable socket implemented on top of UDP.
 
-    Typical usage — server:
-        s = RUDPSocket()
-        s.bind(("0.0.0.0", 9000))
-        s.accept()                 # blocks until 3-way handshake done
-        data = s.recv(4096)
-        s.send(b"hello")
-        s.close()
-        s.destroy()
-
-    Typical usage — client:
-        c = RUDPSocket()
-        c.connect(("127.0.0.1", 9000))
-        c.send(b"hi")
-        resp = b""
-        while True:
-            chunk = c.recv(4096)
-            if not chunk: break
-            resp += chunk
-        c.close()
-        c.destroy()
-
-    Note: we use Stop-and-Wait ARQ — one outstanding unacknowledged
-    packet at a time. Sequence numbers increment by one per packet
-    (SYN/DATA/FIN each consume one number; pure ACKs do not).
-    """
-
-    # -------------------- construction / lifecycle --------------------
+    #      construction / lifecycle     
 
     def __init__(
         self,
@@ -231,7 +148,7 @@ class RUDPSocket:
         self.recv_window_max: int = 65535  # max we will advertise to peer (for flow control)
 
 
-    # -------------------- logging --------------------
+    #      logging     
 
     def _log(self, msg: str) -> None:
         if not self.debug:
@@ -245,7 +162,7 @@ class RUDPSocket:
             pass
         print(f"[RUDP {me[0]}:{me[1]}] {msg}")
 
-    # -------------------- simulation helpers --------------------
+    #      simulation helpers     
     #
     # The lab explicitly asks for "methods specially created" for
     # simulating packet loss and corruption. Those are below.
@@ -300,7 +217,7 @@ class RUDPSocket:
         except OSError as e:
             self._log(f"sendto failed: {e}")
 
-    # -------------------- receive helpers --------------------
+    #      receive helpers     
 
     def _recvfrom_with_timeout(self, timeout: float):
         """recvfrom that respects a specific timeout (may be < self.timeout
@@ -341,7 +258,7 @@ class RUDPSocket:
             # strict stop-and-wait but could happen with reordering. Drop.
             self._log(f"DROP data seq={seq} (expected {self.recv_seq})")
 
-    # -------------------- bind / connect / accept --------------------
+    #      bind / connect / accept     
 
     def bind(self, addr: Tuple[str, int]) -> None:
         """Bind the underlying UDP socket to `addr`."""
@@ -492,7 +409,7 @@ class RUDPSocket:
 
         return False
 
-    # -------------------- send / recv --------------------
+    #      send / recv     
     def _on_ack_received(self):
         """Call this every time a valid ACK comes in."""
         if self.cwnd < self.ssthresh:
@@ -665,7 +582,7 @@ class RUDPSocket:
         del self.recv_buffer[:take]
         return out
 
-    # -------------------- close --------------------
+    # close     
 
     def close(self) -> None:
         """Tear down the logical connection. Sends FIN and waits for ACK
@@ -721,7 +638,7 @@ class RUDPSocket:
 
         # Could not confirm FIN/ACK — we still mark closed so we don't
         # loop forever. A real TCP would go through TIME_WAIT; for a lab
-        # this is an acceptable approximation.
+        # this is an approximation.
         self._log("close: giving up without confirmed FIN/ACK")
         self.closed = True
 
@@ -733,7 +650,6 @@ class RUDPSocket:
         except Exception:
             pass
 
-    # -------------------- context-manager sugar --------------------
 
     def __enter__(self):
         return self

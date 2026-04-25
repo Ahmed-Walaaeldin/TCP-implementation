@@ -1,20 +1,8 @@
 """
-http_client.py — HTTP/1.0 client built on the RUDP transport
-
-Usage (as a library):
-
-    from http_client import http_get, http_post
-    resp = http_get("127.0.0.1", 9000, "/index.html")
-    print(resp.status, resp.body)
-
 Usage (CLI):
 
     python http_client.py GET  http://127.0.0.1:9000/index.html
-    python http_client.py POST http://127.0.0.1:9000/upload/hi.txt --body 'hello'
-
-The URL scheme in the CLI is written "http://" for familiarity even
-though the transport is really our reliable UDP — it's just a way to
-pass host/port/path on the command line.
+    python http_client.py POST http://127.0.0.1:9000/upload/hi.txt --body 'any text'
 """
 
 from __future__ import annotations
@@ -86,9 +74,7 @@ def http_post(
     return _do_request(host, port, req, loss_rate, corrupt_rate, debug)
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def _parse_url(url: str):
     u = urllib.parse.urlparse(url)

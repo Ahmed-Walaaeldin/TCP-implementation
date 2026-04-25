@@ -1,17 +1,3 @@
-"""
-http_message.py — HTTP 1.0 request and response objects
-
-Implements enough of RFC 1945 (HTTP/1.0) to support the lab:
-    * Request line and status line parsing/building
-    * Header folding into case-insensitive dictionaries
-    * GET and POST methods
-    * Status codes 200 OK and 404 Not Found (plus a few helpers)
-    * Proper Content-Length, Content-Type, Server, Date, Host headers
-
-All I/O is bytes; text headers are encoded as ISO-8859-1 (the legacy
-HTTP encoding). Bodies may be arbitrary bytes.
-"""
-
 from __future__ import annotations
 
 import email.utils
@@ -22,16 +8,9 @@ CRLF = b"\r\n"
 HEADER_TERMINATOR = b"\r\n\r\n"
 
 
-# ---------------------------------------------------------------------------
 # Case-insensitive header dict
-# ---------------------------------------------------------------------------
 
 class Headers(dict):
-    """
-    A thin wrapper around dict that preserves the first-seen casing on
-    output but compares keys case-insensitively — matching HTTP's rule
-    that header names are case-insensitive.
-    """
 
     def __init__(self, initial: Optional[Dict[str, str]] = None):
         super().__init__()
@@ -67,21 +46,9 @@ class Headers(dict):
         return self[key]
 
 
-# ---------------------------------------------------------------------------
 # HTTP request
-# ---------------------------------------------------------------------------
 
 class HTTPRequest:
-    """
-    Represents an HTTP/1.0 request (possibly with a body for POST).
-
-    Required fields on a well-formed request:
-        method  — "GET" or "POST" (others rejected at server layer)
-        path    — e.g. "/", "/index.html", "/submit?x=1"
-        version — always "HTTP/1.0" for this lab
-        headers — Headers(), case-insensitive
-        body    — bytes (empty for GET)
-    """
 
     def __init__(
         self,
@@ -97,7 +64,7 @@ class HTTPRequest:
         self.headers = Headers(headers or {})
         self.body = body if isinstance(body, (bytes, bytearray)) else str(body).encode()
 
-    # -------- serialisation --------
+    #      serialisation     
 
     def to_bytes(self) -> bytes:
         # Make sure Content-Length matches the body; required for POST.
@@ -116,7 +83,7 @@ class HTTPRequest:
         top = CRLF.join(lines) + HEADER_TERMINATOR
         return top + self.body
 
-    # -------- parsing --------
+    # parsing
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "HTTPRequest":
@@ -153,16 +120,12 @@ class HTTPRequest:
         return cls(method=method, path=path, version=version,
                    headers=dict(headers), body=body)
 
-    # -------- diagnostics --------
+    # diagnostics
 
     def __repr__(self) -> str:
         return (f"<HTTPRequest {self.method} {self.path} "
                 f"headers={len(self.headers)} body={len(self.body)}B>")
 
-
-# ---------------------------------------------------------------------------
-# HTTP response
-# ---------------------------------------------------------------------------
 
 class HTTPResponse:
     """
@@ -201,7 +164,7 @@ class HTTPResponse:
         self.body = body
         self.reason = reason or self.STATUS_MESSAGES.get(status, "Unknown")
 
-    # -------- defaults --------
+    #  defaults 
 
     def _apply_default_headers(self) -> None:
         self.headers["Content-Length"] = str(len(self.body))
@@ -212,7 +175,7 @@ class HTTPResponse:
         # HTTP/1.0 default is non-persistent — state this explicitly.
         self.headers.setdefault("Connection", "close")
 
-    # -------- serialisation --------
+    #  serialisation 
 
     def to_bytes(self) -> bytes:
         self._apply_default_headers()
@@ -223,7 +186,7 @@ class HTTPResponse:
         top = CRLF.join(lines) + HEADER_TERMINATOR
         return top + self.body
 
-    # -------- parsing --------
+    #  parsing 
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "HTTPResponse":
@@ -257,9 +220,8 @@ class HTTPResponse:
                 f"body={len(self.body)}B>")
 
 
-# ---------------------------------------------------------------------------
+
 # Helpers for reading a full message from a reliable-stream socket
-# ---------------------------------------------------------------------------
 
 def read_full_request(conn) -> Optional[HTTPRequest]:
     """
@@ -310,13 +272,6 @@ def read_full_request(conn) -> Optional[HTTPRequest]:
 
 
 def read_full_response(conn, expect_close: bool = True) -> HTTPResponse:
-    """
-    Read a complete HTTP response from a stream-like object.
-
-    For HTTP/1.0, if Content-Length is given we stop there; otherwise we
-    read until the peer closes (the historical HTTP/1.0 "end = EOF"
-    framing rule).
-    """
     buf = bytearray()
     while HEADER_TERMINATOR not in buf:
         chunk = conn.recv(4096)

@@ -1,9 +1,5 @@
 """
-demo.py — one-shot demo that runs the HTTP server in a background
-thread and exercises it with a few client requests, printing the full
-protocol trace.
-
-Run with:
+Run cases:
     python demo.py                   # default (no loss, no corruption)
     python demo.py --loss 0.2        # drop 20% of outgoing packets
     python demo.py --corrupt 0.2     # corrupt 20% of outgoing packets

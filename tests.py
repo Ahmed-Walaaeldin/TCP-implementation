@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -25,9 +24,7 @@ from http_server import HTTPServer
 from http_client import http_get, http_post
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def free_port() -> int:
     """Grab a free UDP port from the OS."""
@@ -48,9 +45,7 @@ def run_server(**kwargs) -> tuple[HTTPServer, threading.Thread, int]:
     return server, t, port
 
 
-# ---------------------------------------------------------------------------
 # Checksum tests
-# ---------------------------------------------------------------------------
 
 class ChecksumTests(unittest.TestCase):
 
@@ -96,9 +91,7 @@ class ChecksumTests(unittest.TestCase):
                                 f"checksum unchanged after flipping bit {bit_pos}")
 
 
-# ---------------------------------------------------------------------------
 # Packet encode / decode tests
-# ---------------------------------------------------------------------------
 
 class PacketTests(unittest.TestCase):
 
@@ -149,9 +142,7 @@ class PacketTests(unittest.TestCase):
         self.assertFalse(parsed["valid"])
 
 
-# ---------------------------------------------------------------------------
 # HTTP message tests
-# ---------------------------------------------------------------------------
 
 class HTTPMessageTests(unittest.TestCase):
 
@@ -199,9 +190,7 @@ class HTTPMessageTests(unittest.TestCase):
         self.assertEqual(len(h), 2)
 
 
-# ---------------------------------------------------------------------------
 # End-to-end integration tests
-# ---------------------------------------------------------------------------
 
 class HTTPEndToEndTests(unittest.TestCase):
     """Run a real server in a thread and exercise it with a real client
@@ -257,9 +246,7 @@ class HTTPEndToEndTests(unittest.TestCase):
         self.assertEqual(r2.body, payload)
 
 
-# ---------------------------------------------------------------------------
 # Reliability under simulated loss / corruption
-# ---------------------------------------------------------------------------
 
 class ReliabilityTests(unittest.TestCase):
     """Validate that retransmission recovers from packet loss and that
@@ -351,9 +338,7 @@ class ForcedBadChecksumTests(unittest.TestCase):
             tmp.cleanup()
 
 
-# ---------------------------------------------------------------------------
 # Flow Control tests  (NEW)
-# ---------------------------------------------------------------------------
 
 class FlowControlPacketTests(unittest.TestCase):
     """Verify that the window field is present and correctly parsed
@@ -491,9 +476,7 @@ class FlowControlSocketTests(unittest.TestCase):
         sock.destroy()
 
 
-# ---------------------------------------------------------------------------
 # Congestion Control tests  (NEW)
-# ---------------------------------------------------------------------------
 
 class CongestionControlTests(unittest.TestCase):
     """Verify slow-start growth, AIMD on timeout, and ssthresh transition."""
