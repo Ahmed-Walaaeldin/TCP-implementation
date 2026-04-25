@@ -50,8 +50,10 @@ def _do_request(
         resp = read_full_response(sock, expect_close=True)
         return resp
     finally:
-        sock.close()
-        sock.destroy()
+        try:
+            sock.close()
+        finally:
+            sock.destroy()
 
 
 def http_get(

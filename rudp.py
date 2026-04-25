@@ -1,6 +1,4 @@
 """
-rudp.py — Reliable Transport over UDP
-
 Implements a TCP-like reliable stream abstraction on top of UDP:
     * 3-way handshake            (SYN / SYN-ACK / ACK)
     * Stop-and-Wait ARQ          (one outstanding packet at a time)
@@ -13,8 +11,6 @@ Implements a TCP-like reliable stream abstraction on top of UDP:
 The RUDPSocket class exposes a Berkeley-socket-like API:
     bind() / connect() / accept() / send() / recv() / close()
 
-CC451 — Computer Networks, Spring 2026
-Alexandria University, Faculty of Engineering
 """
 
 from __future__ import annotations
@@ -51,8 +47,8 @@ FLAG_SYN = 0x01
 FLAG_ACK = 0x02
 FLAG_FIN = 0x04
 
-HEADER_FMT = "!IIBHH"                       # seq, ack, flags, checksum, plen
-HEADER_LEN = struct.calcsize(HEADER_FMT)    # == 13
+HEADER_FMT = "!IIBHHH"  # seq, ack, flags, checksum, plen, window
+HEADER_LEN = struct.calcsize(HEADER_FMT)  # recalculate
 
 MAX_PAYLOAD = 1024                          # bytes per RUDP segment
 MAX_PACKET = HEADER_LEN + MAX_PAYLOAD
@@ -97,21 +93,13 @@ def internet_checksum(data: bytes) -> int:
     return (~total) & 0xFFFF
 
 
-# ---------------------------------------------------------------------------
 # Packet build / parse
-# ---------------------------------------------------------------------------
 
-def make_packet(seq: int, ack: int, flags: int, payload: bytes = b"") -> bytes:
-    """
-    Build a wire-format packet with a correct checksum.
-
-    The checksum is computed with the checksum field temporarily set to
-    zero and then placed back into the header.
-    """
+def make_packet(seq, ack, flags, payload=b"", window=65535):
     plen = len(payload)
-    zero_hdr = struct.pack(HEADER_FMT, seq, ack, flags, 0, plen)
+    zero_hdr = struct.pack(HEADER_FMT, seq, ack, flags, 0, plen, window)
     chk = internet_checksum(zero_hdr + payload)
-    real_hdr = struct.pack(HEADER_FMT, seq, ack, flags, chk, plen)
+    real_hdr = struct.pack(HEADER_FMT, seq, ack, flags, chk, plen, window)
     return real_hdr + payload
 
 
@@ -127,7 +115,7 @@ def parse_packet(raw: bytes) -> Optional[dict]:
     """
     if len(raw) < HEADER_LEN:
         return None
-    seq, ack, flags, chk, plen = struct.unpack(HEADER_FMT, raw[:HEADER_LEN])
+    seq, ack, flags, chk, plen, window = struct.unpack(HEADER_FMT, raw[:HEADER_LEN])
     payload = raw[HEADER_LEN : HEADER_LEN + plen]
     if len(payload) != plen:
         # truncated payload — treat as corrupted
@@ -135,14 +123,13 @@ def parse_packet(raw: bytes) -> Optional[dict]:
             "seq": seq, "ack": ack, "flags": flags,
             "checksum": chk, "payload": payload, "valid": False,
         }
-    zero_hdr = struct.pack(HEADER_FMT, seq, ack, flags, 0, plen)
+    zero_hdr = struct.pack(HEADER_FMT, seq, ack, flags, 0, plen, window)
     expected = internet_checksum(zero_hdr + payload)
     return {
         "seq": seq, "ack": ack, "flags": flags,
         "checksum": chk, "payload": payload,
-        "valid": expected == chk,
+        "window": window, "valid": expected == chk,
     }
-
 
 def flags_to_str(flags: int) -> str:
     """Pretty-print flag bits for logging, e.g. 'SYN|ACK'."""
@@ -238,13 +225,25 @@ class RUDPSocket:
         self.recv_buffer: bytearray = bytearray()
         self.got_fin: bool = False
         self.closed: bool = False
+        self.peer_window: int = 65535  # receiver's advertised window size
+        self.cwnd = 1          # congestion window (in segments)
+        self.ssthresh = 16     # slow start threshold
+        self.recv_window_max: int = 65535  # max we will advertise to peer (for flow control)
+
 
     # -------------------- logging --------------------
 
     def _log(self, msg: str) -> None:
-        if self.debug:
-            me = self.udp.getsockname() if self.udp.fileno() != -1 else ("?", "?")
-            print(f"[RUDP {me[0]}:{me[1]}] {msg}")
+        if not self.debug:
+            return
+        me = ("?", "?")
+        try:
+            if self.udp.fileno() != -1:
+                me = self.udp.getsockname()
+        except OSError:
+            # On Windows this can fail on an unbound UDP socket.
+            pass
+        print(f"[RUDP {me[0]}:{me[1]}] {msg}")
 
     # -------------------- simulation helpers --------------------
     #
@@ -323,12 +322,12 @@ class RUDPSocket:
         duplicate, or silently discard an out-of-order packet."""
         seq = pkt["seq"]
         if seq == self.recv_seq:
-            # in-order: deliver
             self.recv_buffer += pkt["payload"]
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            ack_pkt = make_packet(self.send_seq, self.recv_seq, FLAG_ACK)
-            self._log(f"-> ACK ack={self.recv_seq} (data seq={seq} accepted, "
-                      f"{len(pkt['payload'])} B)")
+            
+            free = max(0, self.recv_window_max - len(self.recv_buffer))  # add this constant e.g. 65535
+            ack_pkt = make_packet(self.send_seq, self.recv_seq, FLAG_ACK, window=free)
+
             self._send_raw(ack_pkt, self.peer_addr)
         elif seq < self.recv_seq:
             # duplicate of a packet we already accepted: the peer's ACK
@@ -356,7 +355,6 @@ class RUDPSocket:
             --> ACK (seq=X+1, ack=Y+1)
         """
         self._reset_state()
-        self.peer_addr = addr
 
         client_isn = random.randrange(0, 10_000)
         self.send_seq = client_isn
@@ -390,6 +388,7 @@ class RUDPSocket:
                 self.send_seq = (self.send_seq + 1) & 0xFFFFFFFF
                 self.recv_seq = (pkt["seq"] + 1) & 0xFFFFFFFF
                 final_ack = make_packet(self.send_seq, self.recv_seq, FLAG_ACK)
+                self.peer_addr = addr
                 self._log(f"-> ACK seq={self.send_seq} ack={self.recv_seq} "
                           f"(handshake complete)")
                 self._send_raw(final_ack, addr)
@@ -494,6 +493,19 @@ class RUDPSocket:
         return False
 
     # -------------------- send / recv --------------------
+    def _on_ack_received(self):
+        """Call this every time a valid ACK comes in."""
+        if self.cwnd < self.ssthresh:
+            # slow start: exponential growth
+            self.cwnd += 1
+        else:
+            # congestion avoidance: linear growth
+            self.cwnd += 1 / self.cwnd
+
+    def _on_timeout(self):
+        """Call this every time a retransmission timeout fires."""
+        self.ssthresh = max(self.cwnd // 2, 1)
+        self.cwnd = 1  # back to slow start
 
     def send(self, data: bytes) -> int:
         """Reliably transmit `data`. Segments larger than MAX_PAYLOAD are
@@ -515,6 +527,9 @@ class RUDPSocket:
     def _send_one_data_segment(self, payload: bytes) -> None:
         """Stop-and-wait: send one DATA packet, wait for matching ACK
         (retransmitting on timeout), then return."""
+        # block if peer's window is too small for our chunk
+        while len(payload) > self.peer_window:
+            time.sleep(0.05)  # wait and retry
         pkt = make_packet(self.send_seq, self.recv_seq, 0, payload)
 
         for attempt in range(1, self.max_retries + 1):
@@ -528,6 +543,7 @@ class RUDPSocket:
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
+                    self._on_timeout()
                     break  # timeout -> retransmit
 
                 try:
@@ -549,6 +565,8 @@ class RUDPSocket:
                         and rp["ack"] == (self.send_seq + 1) & 0xFFFFFFFF):
                     self._log(f"<- ACK ack={rp['ack']}")
                     self.send_seq = (self.send_seq + 1) & 0xFFFFFFFF
+                    self.peer_window = rp["window"]
+                    self._on_ack_received()
                     return
 
                 # Peer is sending us data concurrently — buffer it.

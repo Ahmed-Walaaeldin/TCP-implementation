@@ -63,8 +63,8 @@ def main(argv=None) -> None:
     print(f"first 80 bytes of body: {r.body[:80]!r}")
 
     # --- GET /hello.txt ---
-    hr("DEMO 2 — GET /hello.txt")
-    r = http_get(args.host, args.port, "/hello.txt", loss_rate=args.loss,
+    hr("DEMO 2 — GET /testing_get.txt")
+    r = http_get(args.host, args.port, "/testing_get.txt", loss_rate=args.loss,
                  corrupt_rate=args.corrupt, debug=args.debug)
     print(f"\nstatus: {r.status} {r.reason}")
     print("body  :")
